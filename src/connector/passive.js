@@ -1,6 +1,6 @@
 const net = require('net');
 const tls = require('tls');
-const ip = require('neoip');
+const ip = require('ip');
 const Promise = require('bluebird');
 
 const Connector = require('./base');
@@ -12,20 +12,50 @@ class Passive extends Connector {
   constructor(connection) {
     super(connection);
     this.type = 'passive';
+
+    // ✅ FIX: latch per non perdere la connessione "troppo veloce"
+    this._pendingSocket = null;
+    this._pendingResolve = null;
   }
 
   waitForConnection({timeout = 5000, delay = 50} = {}) {
     if (!this.dataServer) return Promise.reject(new errors.ConnectorError('Passive server not setup'));
 
+    // ✅ FIX: se la connessione è già arrivata e passata "in un lampo"
+    if (this._pendingSocket) {
+      const s = this._pendingSocket;
+      this._pendingSocket = null;
+      return Promise.resolve(s);
+    }
+
     const checkSocket = () => {
+      // ✅ FIX: considera anche il latch (non solo polling su connected)
+      if (this._pendingSocket) {
+        const s = this._pendingSocket;
+        this._pendingSocket = null;
+        return Promise.resolve(s);
+      }
+
       if (this.dataServer && this.dataServer.listening && this.dataSocket && this.dataSocket.connected) {
         return Promise.resolve(this.dataSocket);
       }
-      return Promise.resolve().delay(delay)
-      .then(() => checkSocket());
+
+      return Promise.resolve()
+        .delay(delay)
+        .then(() => checkSocket());
     };
 
-    return checkSocket().timeout(timeout);
+    // ✅ FIX: oltre al polling, aspetta anche l'evento (race)
+    const eventPromise = new Promise((resolve) => {
+      this._pendingResolve = resolve;
+    });
+
+    return Promise.race([eventPromise, checkSocket()])
+      .timeout(timeout)
+      .finally(() => {
+        // cleanup: evita di lasciare resolve appeso tra comandi
+        this._pendingResolve = null;
+      });
   }
 
   setupServer() {
@@ -33,7 +63,19 @@ class Passive extends Connector {
     return this.server.getNextPasvPort()
     .then((port) => {
       this.dataSocket = null;
+      this._pendingSocket = null;
+      this._pendingResolve = null;
+
       let idleServerTimeout;
+
+      const fulfill = (socket) => {
+        this._pendingSocket = socket;
+        if (this._pendingResolve) {
+          const r = this._pendingResolve;
+          this._pendingResolve = null;
+          r(socket);
+        }
+      };
 
       const connectionHandler = (socket) => {
         if (!ip.isEqual(this.connection.commandSocket.remoteAddress, socket.remoteAddress)) {
@@ -54,6 +96,9 @@ class Passive extends Connector {
         this.dataSocket.on('error', (err) => this.server && this.server.emit('client-error', {connection: this.connection, context: 'dataSocket', error: err}));
         this.dataSocket.once('close', () => this.closeServer());
 
+        // ✅ FIX: cattura subito la connessione (anche se poi dura pochissimo)
+        fulfill(socket);
+
         if (!this.connection.secure) {
           this.dataSocket.connected = true;
         }
@@ -72,6 +117,9 @@ class Passive extends Connector {
       if (this.connection.secure) {
         this.dataServer.on('secureConnection', (socket) => {
           socket.connected = true;
+
+          // ✅ FIX: se arriva già TLS-ready, risolvi anche qui
+          fulfill(socket);
         });
       }
 
